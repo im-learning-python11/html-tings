@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Advanced Movement FPS</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #111; font-family: 'Courier New', Courier, monospace; }
+        #ui { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+        #crosshair { position: absolute; top: 50%; left: 50%; width: 4px; height: 4px; background: #00ffcc; transform: translate(-50%, -50%); border-radius: 50%; display: none; }
+        #speedometer { position: absolute; bottom: 30px; left: 30px; color: #00ffcc; font-size: 24px; font-weight: bold; display: none; }
+        
+        .menu { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); color: white; display: flex; flex-direction: column; justify-content: center; align-items: center; pointer-events: auto; }
+        h1 { font-size: 50px; color: #00ffcc; text-transform: uppercase; margin-bottom: 10px; }
+        p { font-size: 18px; color: #aaa; text-align: center; max-width: 700px; line-height: 1.5; }
+        .controls { background: #222; padding: 15px; border-radius: 8px; margin: 20px 0; border: 1px solid #444; text-align: left; }
+        button { padding: 15px 40px; font-size: 20px; background: #00ffcc; color: #000; border: none; font-weight: bold; cursor: pointer; text-transform: uppercase; transition: 0.2s; }
+        button:hover { background: #fff; }
+    </style>
+</head>
+<body>
+
+    <div id="ui">
+        <div id="crosshair"></div>
+        <div id="speedometer">SPEED: 0 u/s</div>
+    </div>
+
+    <div id="start-menu" class="menu">
+        <h1>Velocity Engine 3.0</h1>
+        <div class="controls">
+            <p><b>WASD:</b> Move | <b>Mouse:</b> Look</p>
+            <p><b>Hold SPACE:</b> Auto-Bhop & Walljump (Uncapped Speed)</p>
+            <p><b>Hold SHIFT:</b> Slide (Removes friction, maintains momentum)</p>
+            <p><b>Hold E:</b> Snappy Grapple (Instant directional yank)</p>
+        </div>
+        <button id="start-btn">Enter Arena</button>
+    </div>
+
+    <script type="importmap">{ "imports": { 
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+        "cannon-es": "https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js"
+    }}</script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import * as CANNON from 'cannon-es';
+        import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+
+        // --- GAME STATE & CONSTANTS ---
+        let isPlaying = false;
+        const NORMAL_HEIGHT = 1.0;
+        const SLIDE_HEIGHT = 0.2;
+        const JUMP_FORCE = 12;
+        const MAX_GROUND_SPEED = 20;
+        const MAX_AIR_SPEED = 120; // Massively increased for true bhopping
+        
+        // --- THREE.JS SETUP ---
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x111115, 0.015);
+        scene.background = new THREE.Color(0x111115);
+
+        const camera = new THREE.PerspectiveCamera(90, window.innerWidth/window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 0.4));
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(20, 50, 20);
+        scene.add(dirLight);
+
+        // --- PHYSICS SETUP ---
+        const physicsMaterial = new CANNON.Material("standard");
+        const physicsContactMaterial = new CANNON.ContactMaterial(physicsMaterial, physicsMaterial, { friction: 0.0, restitution: 0.0 });
+        const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -25, 0) });
+        world.addContactMaterial(physicsContactMaterial);
+
+        // --- ENVIRONMENT ---
+        const floorMesh = new THREE.Mesh(new THREE.PlaneGeometry(300, 300), new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.9 }));
+        floorMesh.rotation.x = -Math.PI / 2;
+        scene.add(floorMesh);
+        
+        const gridHelper = new THREE.GridHelper(300, 150, 0x00ffcc, 0x333333);
+        gridHelper.position.y = 0.01;
+        scene.add(gridHelper);
+
+        const floorBody = new CANNON.Body({ mass: 0, shape: new CANNON.Plane(), material: physicsMaterial });
+        floorBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+        world.addBody(floorBody);
+
+        const mapMeshes = [];
+
+        function addBlock(x, y, z, w, h, d) {
+            const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), new THREE.MeshStandardMaterial({color: 0x444455}));
+            mesh.position.set(x, y, z);
+            scene.add(mesh);
+            mapMeshes.push(mesh); 
+
+            const body = new CANNON.Body({ mass: 0, shape: new CANNON.Box(new CANNON.Vec3(w/2, h/2, d/2)), material: physicsMaterial });
+            body.position.set(x, y, z);
+            world.addBody(body);
+        }
+        
+        // Expanded arena for high speed
+        addBlock(0, 5, -30, 10, 10, 2); 
+        addBlock(20, 15, -20, 4, 30, 4); 
+        addBlock(-20, 12, -20, 4, 24, 4); 
+        addBlock(0, 2, -60, 30, 4, 30); 
+        addBlock(15, 20, -50, 2, 40, 30); 
+
+        // --- PLAYER SETUP ---
+        const playerRadius = 0.5;
+        const playerBody = new CANNON.Body({ mass: 5, shape: new CANNON.Sphere(playerRadius), material: physicsMaterial, fixedRotation: true });
+        playerBody.position.set(0, 5, 0);
+        world.addBody(playerBody);
+
+        const controls = new PointerLockControls(camera, document.body);
+
+        const armGroup = new THREE.Group();
+        camera.add(armGroup);
+        scene.add(camera);
+        const armMesh = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.15, 0.5), new THREE.MeshStandardMaterial({color: 0xaaaaaa}));
+        armMesh.position.set(0.3, -0.3, -0.5);
+        armGroup.add(armMesh);
+
+        // --- GRAPPLING HOOK LOGIC ---
+        let isGrappling = false;
+        let grapplePoint = new THREE.Vector3();
+        let grappleLine;
+        const raycaster = new THREE.Raycaster();
+
+        function createGrappleLine() {
+            const mat = new THREE.LineBasicMaterial({ color: 0xffaa00, linewidth: 3 });
+            const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+            grappleLine = new THREE.Line(geo, mat);
+            scene.add(grappleLine);
+        }
+        createGrappleLine();
+
+        // --- INPUT HANDLING ---
+        const keys = {};
+        let isSliding = false;
+        let slideCooldown = false;
+        let wallJumpCooldown = false;
+
+        document.getElementById('start-btn').onclick = () => controls.lock();
+
+        controls.addEventListener('lock', () => {
+            document.getElementById('start-menu').style.display = 'none';
+            document.getElementById('crosshair').style.display = 'block';
+            document.getElementById('speedometer').style.display = 'block';
+            isPlaying = true;
+        });
+
+        controls.addEventListener('unlock', () => {
+            document.getElementById('start-menu').style.display = 'flex';
+            isPlaying = false;
+        });
+
+        window.onkeydown = (e) => {
+            keys[e.code] = true;
+            if (e.code === 'KeyE' && !isGrappling && isPlaying) {
+                raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+                const intersects = raycaster.intersectObjects(mapMeshes);
+                if (intersects.length > 0 && intersects[0].distance < 80) { // Increased grapple range
+                    isGrappling = true;
+                    grapplePoint.copy(intersects[0].point);
+                }
+            }
+        };
+        
+        window.onkeyup = (e) => {
+            keys[e.code] = false;
+            if (e.code === 'KeyE') isGrappling = false;
+        };
+
+        // --- GAME LOOP ---
+        const clock = new THREE.Clock();
+        const speedometer = document.getElementById('speedometer');
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            world.step(1/60, delta, 3);
+
+            if (isPlaying) {
+                const isGrounded = playerBody.position.y <= playerRadius + 0.15; // Slightly more forgiving ground check
+
+                const front = new THREE.Vector3();
+                camera.getWorldDirection(front);
+                const side = new THREE.Vector3().crossVectors(front, new THREE.Vector3(0, 1, 0));
+                
+                front.y = 0; front.normalize();
+                side.y = 0; side.normalize();
+
+                let moveX = 0, moveZ = 0;
+                if (keys['KeyW']) { moveX += front.x; moveZ += front.z; }
+                if (keys['KeyS']) { moveX -= front.x; moveZ -= front.z; }
+                if (keys['KeyA']) { moveX -= side.x; moveZ -= side.z; }
+                if (keys['KeyD']) { moveX += side.x; moveZ += side.z; }
+
+                const inputMag = Math.sqrt(moveX*moveX + moveZ*moveZ);
+                if (inputMag > 0) { moveX /= inputMag; moveZ /= inputMag; }
+
+                // --- 1. SNAPPY GRAPPLING HOOK ---
+                if (isGrappling) {
+                    const gunWorldPos = new THREE.Vector3();
+                    armMesh.getWorldPosition(gunWorldPos);
+                    grappleLine.geometry.setFromPoints([gunWorldPos, grapplePoint]);
+                    grappleLine.visible = true;
+
+                    const pullDir = new THREE.Vector3().subVectors(grapplePoint, playerBody.position).normalize();
+                    const dist = playerBody.position.distanceTo(grapplePoint);
+                    
+                    if (dist > 3) {
+                        // Direct Velocity Injection for an instant, violent yank
+                        playerBody.velocity.x += pullDir.x * 2.5;
+                        playerBody.velocity.y += pullDir.y * 2.5; 
+                        playerBody.velocity.z += pullDir.z * 2.5;
+                    }
+                } else {
+                    grappleLine.visible = false;
+                }
+
+                // --- 2. SLIDING ---
+                if (keys['ShiftLeft'] && isGrounded && inputMag > 0 && !isSliding && !slideCooldown) {
+                    isSliding = true;
+                    playerBody.velocity.x += moveX * 12; // Stronger slide boost
+                    playerBody.velocity.z += moveZ * 12;
+                    camera.fov = 110; camera.updateProjectionMatrix();
+                } else if (!keys['ShiftLeft'] || !isGrounded) {
+                    if (isSliding) {
+                        isSliding = false; slideCooldown = true;
+                        setTimeout(() => slideCooldown = false, 400);
+                        camera.fov = 90; camera.updateProjectionMatrix();
+                    }
+                }
+
+                // --- 3. JUMPING & WALL JUMPING ---
+                if (keys['Space']) {
+                    if (isGrounded) {
+                        playerBody.velocity.y = JUMP_FORCE;
+                        if (isSliding) { playerBody.velocity.x += moveX * 5; playerBody.velocity.z += moveZ * 5; }
+                    } else if (!wallJumpCooldown) {
+                        const pPos = new THREE.Vector3(playerBody.position.x, playerBody.position.y, playerBody.position.z);
+                        const dirs = [new THREE.Vector3(1,0,0), new THREE.Vector3(-1,0,0), new THREE.Vector3(0,0,1), new THREE.Vector3(0,0,-1)];
+                        
+                        for (let d of dirs) {
+                            raycaster.set(pPos, d);
+                            const hits = raycaster.intersectObjects(mapMeshes);
+                            if (hits.length > 0 && hits[0].distance < playerRadius + 1.5) {
+                                playerBody.velocity.y = JUMP_FORCE * 1.1; // Stronger wall kick
+                                playerBody.velocity.x += hits[0].face.normal.x * 20; 
+                                playerBody.velocity.z += hits[0].face.normal.z * 20;
+                                
+                                wallJumpCooldown = true;
+                                setTimeout(() => wallJumpCooldown = false, 300);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // --- 4. AIR & GROUND CONTROL ---
+                let currentHorizontalSpeed = Math.sqrt(playerBody.velocity.x**2 + playerBody.velocity.z**2);
+
+                if (isGrounded) {
+                    playerBody.linearDamping = isSliding ? 0.02 : 0.9;
+                    if (inputMag > 0 && !isGrappling) {
+                        playerBody.applyForce(new CANNON.Vec3(moveX * 180, 0, moveZ * 180), playerBody.position);
+                    }
+                } else {
+                    // ZERO AIR DRAG: The fix for A/D slowing you down.
+                    playerBody.linearDamping = 0.0; 
+                    
+                    if (inputMag > 0 && !isGrappling) {
+                        // Apply pure additive force in the air to allow infinite speed building
+                        const airAccel = 35; 
+                        playerBody.applyForce(new CANNON.Vec3(moveX * airAccel, 0, moveZ * airAccel), playerBody.position);
+                    }
+                }
+
+                // --- SPEED LIMITS ---
+                const activeMaxSpeed = isGrounded && !isSliding ? MAX_GROUND_SPEED : MAX_AIR_SPEED;
+                
+                // Only cap speed on the ground. In the air or sliding, keep momentum!
+                if (currentHorizontalSpeed > activeMaxSpeed && isGrounded && !isSliding) {
+                    playerBody.velocity.x *= 0.85; // Faster deceleration when hitting normal ground
+                    playerBody.velocity.z *= 0.85;
+                }
+
+                // --- CAMERA SYNC ---
+                const targetCamY = playerBody.position.y + (isSliding ? SLIDE_HEIGHT : NORMAL_HEIGHT);
+                camera.position.set(playerBody.position.x, THREE.MathUtils.lerp(camera.position.y, targetCamY, 0.3), playerBody.position.z);
+
+                // --- UI ---
+                speedometer.innerText = `SPEED: ${Math.round(currentHorizontalSpeed)} u/s`;
+                document.getElementById('crosshair').style.background = isGrappling ? '#ffaa00' : (currentHorizontalSpeed > MAX_GROUND_SPEED + 5 ? '#ff0055' : '#00ffcc');
+            }
+
+            renderer.render(scene, camera);
+        }
+        
+        animate();
+    </script>
+</body>
+</html>
